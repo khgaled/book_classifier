@@ -134,7 +134,7 @@ Here are some reminders for sentiment score analysis:
 This visualization displays the distribution of sentiment scores across major book genres. **Most categories show neutral-to-positive sentiment**, with medians generally above zero. Genres like Self-Help, Children’s Books, and Humor & Entertainment tend to have higher sentiment, while Politics & Social Sciences, Law, and Religion & Spirituality display broader ranges and lower medians, suggesting more polarized (black-and-white thinking) opinions. **Overall, the plot highlights that sentiment patterns vary notably across genres, offering potential predictive value for modeling.**
 
 
-When we look into the visualization that breaks down sentiment scores by detailed subgenres, the sentiment scores are colored the same way as the Sentiment Score Distribution graph above.
+When we look into the visualization that breaks down sentiment scores by detailed subgenres, the sentiment scores are colored the same way as the Sentiment Score Distribution graph above. **Note: if video does not show in markdown, check assets**
 
 <video controls src="../assets/Category lvl 3 Sentiment Score distribution.mp4" title="Title"></video>
 
