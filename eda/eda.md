@@ -136,9 +136,7 @@ This visualization displays the distribution of sentiment scores across major bo
 
 When we look into the visualization that breaks down sentiment scores by detailed subgenres, the sentiment scores are colored the same way as the Sentiment Score Distribution graph above.
 
-
 <video controls src="../assets/Category lvl 3 Sentiment Score distribution.mp4" title="Title"></video>
-
 
 Similar to the broader genres, most subgenres lean positive, but the spread and variability are more pronounced at this level. Fictional subgenres such as Thrillers, Romance, and Fantasy show wide sentiment ranges, indicating strong emotional responses from readers. On the other hand, smaller subgenres like History & Criticism or Politics & Government exhibit higher polarization. **The detailed view emphasizes how subgenre-level sentiment diversity could serve as a nuanced feature for understanding user tone and engagement.**
 
