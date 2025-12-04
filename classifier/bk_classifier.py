@@ -1,25 +1,17 @@
 import pandas as pd
-import sklearn as sk
-import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
 import re
 from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sentence_transformers import SentenceTransformer
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (classification_report, 
-                             confusion_matrix, 
-                             roc_auc_score, 
                              accuracy_score, 
                              precision_score, 
                              recall_score, 
-                             f1_score, 
-                             roc_curve, 
-                             precision_recall_curve,
-                             average_precision_score)
+                             f1_score)
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.dummy import DummyClassifier
 
 # HELPER FUNCTIONS
@@ -47,21 +39,6 @@ def clean_review_text(text: str,
         if word not in genre_words and word not in common_stopwords
     ]
     return ' '.join(filtered_words)
-
-def build_tfidf(df: pd.DataFrame, 
-                col: str = 'text',
-                max_features=300, 
-                min_df=2):
-    """
-    Returns a content-level TF-IDF dataframe:
-      columns: tf_<token>..., plus 'content_id'
-    """
-    vec = TfidfVectorizer(max_features=max_features, stop_words='english', min_df=min_df)
-    X = vec.fit_transform(df[col].fillna(''))
-    tfidf_cols = [f"tf_{t}" for t in vec.get_feature_names_out()]
-    tfidf_df = pd.DataFrame(X.toarray(), columns=tfidf_cols)
-    tfidf_df['asin'] = df['asin'].values
-    return tfidf_df, tfidf_cols
 
 # Data Loading and Preprocessing
 ''' 
@@ -111,22 +88,104 @@ common_stopwords = {
 print("\nCleaning book reviews...")
 amzbks['review_text'] = amzbks['text'].progress_apply(lambda x: clean_review_text(x, genre_words, common_stopwords))
 
-# Build TF-IDF features from cleaned review text
-print("\nBuilding TF-IDF features...")
-tfidf_df, tfidf_cols = build_tfidf(amzbks, col='review_text', max_features=300, min_df=2)
+# cleaning author about text 
+print("\nCleaning author about text...")
+amzbks['about_author'] = amzbks['author_about'].progress_apply(lambda x: clean_review_text(x, genre_words, common_stopwords) if pd.notnull(x) else '')
+
+# cleaning book description text
+print("\nCleaning book description...")
+amzbks['book_desc'] = amzbks['features_text'].progress_apply(lambda x: clean_review_text(x, genre_words, common_stopwords) if pd.notnull(x) else '')
+
+# aggregating to book level
+print("\nAggregating to book level...")
+bk_lvl = (
+    amzbks
+    .groupby(['asin', 'category_level_2_sub'], as_index=False)
+    .agg({
+        'sentiment_score': 'mean',       # average sentiment across reviews
+        'rating': 'mean',                # average user rating for the book
+        'average_rating': 'first',       
+        'book_desc': 'first',            
+        'about_author': 'first'          
+    })
+)
+
+bk_lvl.rename(columns={'rating': 'user_rating'}, inplace=True)
+
+print("\nBuilding concatenated review text per book...")
+reviews_concat = (
+    amzbks
+    .groupby('asin')['review_text']
+    .apply(lambda s: " ".join(s.astype(str)))
+    .reindex(bk_lvl['asin'])
+    .fillna("")
+    .tolist()
+)
+
+# Build SBERT features from cleaned review text
+print("\nBuilding SBERT features...")
+model = SentenceTransformer("all-mpnet-base-v2")
+
+cache_path = Path("emb_cache.npz")
+
+if cache_path.exists():
+    print("\nLoading embeddings from cache...")
+    data = np.load(cache_path, allow_pickle=True)
+    review_emb = data["review_emb"]
+    author_emb = data["author_emb"]
+    bkdesc_emb = data["bkdesc_emb"]
+    cached_asin = data["asin"]
+    
+    # safety check: make sure cache matches current books
+    if len(cached_asin) != len(bk_lvl) or not np.array_equal(cached_asin, bk_lvl["asin"].values):
+        print("Cache does not match current bk_lvl; recomputing embeddings...")
+        cache_path.unlink()  # delete bad cache
+        # fall through to recompute below
+        cache_path = None
+else:
+    cache_path = None
+
+if cache_path is None:
+    print("\nComputing embeddings (this may take a while)...")
+
+    print("\nBook review embeddings...")
+    review_emb = model.encode(reviews_concat, show_progress_bar=True)
+
+    print("\nAuthor review embeddings...")
+    author_emb = model.encode(bk_lvl['about_author'].tolist(), show_progress_bar=True)
+
+    print("\nBook Desc embeddings...")
+    bkdesc_emb = model.encode(bk_lvl['book_desc'].tolist(), show_progress_bar=True)
+
+    np.savez(
+        "emb_cache.npz",
+        asin=bk_lvl["asin"].values,
+        review_emb=review_emb,
+        author_emb=author_emb,
+        bkdesc_emb=bkdesc_emb,
+    )
+    print("Saved embeddings to emb_cache.npz")
+
+#pool review embeddings at book level
+review_emb_bklvl = review_emb 
+bert_features = np.hstack([review_emb_bklvl, author_emb, bkdesc_emb])
+
+#column names similar to tf-idf tokens
+author_cols = [f"author_emb_{i}" for i in range(author_emb.shape[1])]
+bkdesc_cols = [f"bkdesc_emb_{i}" for i in range(bkdesc_emb.shape[1])]
+review_cols = [f"review_emb_{i}" for i in range(review_emb_bklvl.shape[1])]
+
+sbert_cols = review_cols + author_cols + bkdesc_cols
+
+sbert_df = pd.DataFrame(bert_features, columns=sbert_cols)
+sbert_df['asin'] = bk_lvl['asin'].values
 
 print("\nBuilding features table...")
 # Concat sentiment score and TF-IDF features 
 features_df = pd.concat([
-    amzbks[['asin', 'sentiment_score', 'category_level_2_sub']].reset_index(drop=True),
-    tfidf_df[tfidf_cols].reset_index(drop=True)
+    bk_lvl[['asin', 'sentiment_score', 'user_rating', 'category_level_2_sub']].reset_index(drop=True),
+    sbert_df[sbert_cols].reset_index(drop=True)
 ], axis=1)
-
-# Rating features
-print("\nRating features...")
-features_df['user_rating'] = amzbks['rating']
-features_df['book_avg_rating'] = amzbks['average_rating']
-features_df['rating_deviation'] = abs(features_df['user_rating'] - features_df['book_avg_rating'])
 
 engineered_features = [
     'sentiment_score',
@@ -135,33 +194,25 @@ engineered_features = [
 
 print("\nEVALUATION OF CLASSIFIERS FOR BOOK GENRE PREDICTION\n")
 # Prepare feature matrix X and target vector y
-X = features_df[engineered_features + tfidf_cols]
+X = features_df[engineered_features + sbert_cols]
 y = features_df['category_level_2_sub']
-print(f"\nFeature matrix shape: {X.shape}")
-print(f"Target shape: {y.shape}")
 
-# Check class distribution
-print("\nClass distribution before filtering:")
+print("\nClass distribution before filtering (book-level):")
 class_counts = y.value_counts()
-print(f"Total genres: {len(class_counts)}")
-print(f"Genres with only 1 sample: {(class_counts == 1).sum()}")
-print(f"Genres with <10 samples: {(class_counts < 10).sum()}")
+print(class_counts.head(10))
 
-# Filter out genres with fewer than 2 samples bc of stratified split
-min_samples = 10  # trying at least 10 samples per genre
+min_samples = 10
 valid_genres = class_counts[class_counts >= min_samples].index
-print(f"\nFiltering to genres with at least {min_samples} samples...")
-
-# Filter both X and y
 mask = y.isin(valid_genres)
+
 X_filtered = X[mask].reset_index(drop=True)
 y_filtered = y[mask].reset_index(drop=True)
 
-print(f"\nAfter filtering:")
-print(f"Feature matrix shape: {X_filtered.shape}")
-print(f"Target shape: {y_filtered.shape}")
-print(f"Number of genres: {y_filtered.nunique()}")
-print(f"Samples removed: {len(X) - len(X_filtered)} ({(len(X) - len(X_filtered))/len(X)*100:.2f}%)")
+print(f"\nAfter filtering (book-level):")
+print("Feature matrix shape:", X_filtered.shape)
+print("Target shape:", y_filtered.shape)
+print("Number of genres:", y_filtered.nunique())
+print(f"Books removed: {len(X) - len(X_filtered)}")
 
 # Show top genres
 print("\nTop 10 most common genres:")
@@ -186,25 +237,14 @@ if len(X_train) > sample_size:
     y_train = y_train_sampled
     print(f"New train set size: {len(X_train)}")
 
+#num_classes = y_filtered.nunique()
+
 # Define classifiers to evaluate (with reduced complexity)
 classifiers = {
     'Dummy Classifier (Most Frequent)': DummyClassifier(strategy='most_frequent', random_state=42),
     'Logistic Regression': LogisticRegression(random_state=42, 
                                               max_iter=2000,
-                                              n_jobs=1),
-    # 'Random Forest': RandomForestClassifier(
-    #     random_state=42, 
-    #     n_estimators=50,  
-    #     max_depth=10,      
-    #     min_samples_split=100,  
-    #     n_jobs=1           
-    # ),
-    # 'Gradient Boosting': GradientBoostingClassifier(
-    #     random_state=42, 
-    #     n_estimators=50,  
-    #     max_depth=5,       
-    #     subsample=0.5      
-    # ),
+                                              n_jobs=1)
 }
 
 # Evaluate each classifier
@@ -263,3 +303,68 @@ print(f"\nBest Classifier (by F1-Score): {best_classifier}")
 print(f"\nRetraining {best_classifier} on sampled data...")
 final_model = classifiers[best_classifier]
 final_model.fit(X_train, y_train)
+
+# used for further testing and model 
+def predict_genre_for_new_book(reviews,
+                               book_desc: str,
+                               about_author: str,
+                               user_rating=None,
+                               genre_words=genre_words,
+                               common_stopwords=common_stopwords,
+                               sia=sia,
+                               sbert_model=model,
+                               final_model=final_model,
+                               engineered_features=engineered_features,
+                               sbert_cols=sbert_cols,
+                               bk_lvl=bk_lvl):
+    """
+    Predict genre for a new books not in the dataset.
+    
+    reviews: list of raw review strings (can be 1+)
+    book_desc: raw book description (string)
+    about_author: raw author bio (string)
+    user_rating: numeric (float/int), e.g. 4.3. If None, uses dataset mean.
+    """
+
+    if isinstance(reviews, str):
+        reviews = [reviews]
+
+    # sentiment score calculation
+    if len(reviews) == 0:
+        sentiment_score = 0.0
+        concat_reviews = ""
+    else:
+        sentiment_scores = [sia.polarity_scores(r)['compound'] for r in reviews]
+        sentiment_score = float(np.mean(sentiment_scores))
+
+        # clean and concatenate reviews 
+        cleaned_reviews = [
+            clean_review_text(r, genre_words, common_stopwords) for r in reviews
+        ]
+        concat_reviews = " ".join(cleaned_reviews)
+
+    # user_rating calculation
+    if user_rating is None:
+        user_rating = float(bk_lvl['user_rating'].mean())
+
+    # Clean description and author text
+    desc_clean = clean_review_text(str(book_desc), genre_words, common_stopwords)
+    author_clean = clean_review_text(str(about_author), genre_words, common_stopwords)
+
+    # SBERT embeddings: review text, author, description
+    review_vec = sbert_model.encode([concat_reviews])[0]
+    author_vec = sbert_model.encode([author_clean])[0]
+    desc_vec   = sbert_model.encode([desc_clean])[0]
+
+    sbert_feature_vec = np.hstack([review_vec, author_vec, desc_vec])
+
+    # Combine engineered + SBERT 
+    all_features = np.hstack([[sentiment_score, user_rating], sbert_feature_vec])
+
+    all_feature_names = engineered_features + sbert_cols
+    X_single = pd.DataFrame([all_features], columns=all_feature_names)
+
+    pred_label = final_model.predict(X_single)[0]
+    pred_proba = final_model.predict_proba(X_single)[0]
+
+    return pred_label, pred_proba
